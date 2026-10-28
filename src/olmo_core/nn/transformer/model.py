@@ -364,6 +364,7 @@ class Transformer(nn.Module):
                     if self.embedding_init_std is not None
                     else self.init_std
                 ),
+                embedding_std=self.embedding_init_std,
                 generator=generator,
             )
             if isinstance(self.embeddings, SplitVocabEmbedding):

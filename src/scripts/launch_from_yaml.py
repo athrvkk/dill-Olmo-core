@@ -13,10 +13,20 @@ Batch sizes can be given in sequences instead of tokens with the top-level field
 ``global_batch_size_seqs`` and ``rank_microbatch_size_seqs``; they are multiplied by
 ``dataset.sequence_length`` to set ``data_loader.global_batch_size`` and
 ``train_module.rank_microbatch_size``.
+
+Values can reference other fields with ``${path.to.field}`` (resolved after CLI overrides),
+and simple arithmetic left after substitution is evaluated, e.g.::
+
+    hidden_size: ${model.d_model}*4
+    weight_decay: 1e-4/${train_module.optim.lr}
+    save_folder: checkpoints/${wandb.group}/${wandb.name}
 """
 
 import argparse
+import ast
 import logging
+import operator
+import re
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, cast
@@ -271,12 +281,95 @@ def _resolve_batch_sizes_in_seqs(data: Dict[str, Any]) -> None:
         log.info(f"{section}.{field} = {num_seqs} sequences x {seq_len} = {target[field]} tokens")
 
 
+_INTERPOLATION = re.compile(r"\$\{([^${}]+)\}")
+_ARITHMETIC = re.compile(r"[\d\s.eE+\-*/%()]+")
+_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_UNARY_OPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+
+def _eval_arithmetic(expr: str) -> Any:
+    """Evaluate a numeric expression like ``128*4``; anything else is returned unchanged."""
+    if not _ARITHMETIC.fullmatch(expr):
+        return expr
+
+    def _eval(node: ast.AST) -> Any:
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
+            return _BIN_OPS[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
+            return _UNARY_OPS[type(node.op)](_eval(node.operand))
+        raise ValueError(node)
+
+    try:
+        return _eval(ast.parse(expr.strip(), mode="eval").body)
+    except (SyntaxError, ValueError):
+        return expr
+
+
+def _format_value(value: Any) -> str:
+    """How a referenced value is written when substituted into a longer string."""
+    if isinstance(value, float):
+        return format(value, "g")  # 0.01 -> "0.01", 1e-05 -> "1e-05"
+    return str(value)
+
+
+def _resolve_interpolations(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Resolve ``${path.to.field}`` references anywhere in the raw config. A value that is a single
+    reference keeps the referenced value's type; references inside a longer string are substituted
+    as text, and the result is evaluated if it is a plain arithmetic expression.
+    """
+    in_progress: set = set()
+
+    def lookup(path: str) -> Any:
+        node: Any = data
+        for part in path.split("."):
+            if isinstance(node, dict) and part in node:
+                node = node[part]
+            elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+                node = node[int(part)]
+            else:
+                raise ValueError(f"Can't resolve '${{{path}}}': '{part}' not found")
+        return resolve(node, path)
+
+    def resolve(value: Any, where: str) -> Any:
+        if isinstance(value, dict):
+            return {k: resolve(v, f"{where}.{k}" if where else str(k)) for k, v in value.items()}
+        if isinstance(value, list):
+            return [resolve(v, f"{where}.{i}") for i, v in enumerate(value)]
+        if not isinstance(value, str) or "${" not in value:
+            return value
+        if where in in_progress:
+            raise ValueError(f"Circular reference involving '{where}'")
+        in_progress.add(where)
+        try:
+            if (m := _INTERPOLATION.fullmatch(value.strip())) is not None:
+                return lookup(m.group(1).strip())
+            text = _INTERPOLATION.sub(lambda m: _format_value(lookup(m.group(1).strip())), value)
+            return _eval_arithmetic(text)
+        finally:
+            in_progress.discard(where)
+
+    return resolve(data, "")
+
+
 def _load_config(path: str, overrides: List[str]) -> YamlExperimentConfig:
     with cached_path(path).open() as f:
         data = yaml.safe_load(f)
-    # Apply CLI overrides to the raw YAML first so they can also set the ``*_seqs`` fields.
+    # Apply CLI overrides to the raw YAML first so they flow into interpolations and can also set
+    # the ``*_seqs`` fields.
     for key, value in _clean_opts(overrides):
         _set_nested(data, key, value)
+    data = _resolve_interpolations(data)
     _resolve_batch_sizes_in_seqs(data)
     return YamlExperimentConfig.from_dict(data)
 

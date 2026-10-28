@@ -83,6 +83,7 @@ class InitMethod(StrEnum):
         d_model: int,
         embed_scale: Optional[float] = None,
         std: float = 0.02,
+        embedding_std: Optional[float] = None,
         generator: Optional[torch.Generator] = None,
     ):
         if self in (InitMethod.llama, InitMethod.llama_depth):
@@ -90,8 +91,12 @@ class InitMethod(StrEnum):
         elif self == InitMethod.normalized:
             _apply_init(nn.init.normal_, m.weight, generator=generator, std=d_model**-0.5)
         elif self == InitMethod.fan_in:
-            # Fan-in init uses std = 1.0 for embeddings, scaled down by embed_scale if set
-            emb_std = 1.0 / embed_scale if embed_scale is not None else 1.0
+            # Fan-in init uses std = 1.0 for embeddings, scaled down by embed_scale if set,
+            # unless an explicit ``embedding_std`` (the model's ``embedding_init_std``) is given.
+            if embedding_std is not None:
+                emb_std = embedding_std
+            else:
+                emb_std = 1.0 / embed_scale if embed_scale is not None else 1.0
             _apply_init(nn.init.normal_, m.weight, generator=generator, std=emb_std)
         else:
             _apply_init(

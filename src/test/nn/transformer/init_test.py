@@ -339,3 +339,25 @@ def test_init_weights_model_part_idx_ignored_without_pp():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("d_model", [128, 256])
+def test_fan_in_init_embedding_init_std(d_model):
+    """Test that an explicit ``embedding_init_std`` overrides fan_in's default embedding std of 1.0."""
+    config = TransformerConfig.llama_like(
+        d_model=d_model,
+        vocab_size=1000,
+        n_layers=2,
+        n_heads=d_model // 64,
+        feed_forward=FeedForwardConfig(hidden_size=4 * d_model, bias=False),
+        init_method=InitMethod.fan_in,
+        embedding_init_std=d_model**-0.5,
+    )
+    model = config.build(init_device="cpu")
+    model.init_weights(device=torch.device("cpu"))
+
+    embedding_std = model.embeddings.weight.std().item()
+    expected = d_model**-0.5
+    assert (
+        abs(embedding_std - expected) < 0.05 * expected
+    ), f"Expected embedding std ~{expected:.4f}, got {embedding_std:.4f}"

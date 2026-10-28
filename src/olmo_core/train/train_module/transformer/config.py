@@ -574,3 +574,56 @@ class OLMoDDPTrainModuleConfig(TrainModuleConfig):
             eval_only=eval_only,
             **kwargs,
         )
+
+
+@dataclass
+class TransformerSAMConfig(Config):
+    """
+    A configuration class for building :class:`TransformerSAMTrainModule` instances.
+    """
+
+    rho: float = 0.05
+    """
+    Perturbation radius for the SAM ascent step.
+    """
+
+    m: Optional[int] = None
+    """
+    Per-GPU SAM perturbation batch size in tokens. Controls how many tokens of data
+    are used to compute each perturbation direction on each GPU.
+
+    - When ``m == device_batch_size`` (the default if None): standard SAM — one
+      perturbation per GPU per step, computed from the full device batch.
+    - When ``m < device_batch_size``: m-SAM — the device batch is split into
+      ``device_batch_size / m`` SAM groups, each getting its own independent
+      perturbation direction. Smaller m yields more fine-grained perturbations
+      and stronger implicit regularization.
+    - Must be a multiple of ``rank_microbatch_size``.
+    - Must evenly divide the device batch size (``global_batch_size / dp_world_size``).
+
+    If None, defaults to the device batch size at the start of training.
+    """
+
+    eps: float = 1e-12
+    """
+    Numerical stability constant to avoid divide-by-zero when normalizing gradients.
+    """
+
+    normalization: str = "global"
+    """
+    Normalization mode for the SAM ascent step. One of: "none", "global", "layer".
+    """
+
+    sam_parameter_types: Optional[str] = None
+    """
+    Comma-separated list of module class names (e.g., "Linear,Conv1d") that should
+    receive SAM perturbations. If None or empty, applies to all parameters.
+    """
+
+    def __post_init__(self):
+        if self.rho < 0:
+            raise OLMoConfigurationError("'rho' must be >= 0.")
+        if self.normalization not in {"none", "global", "layer"}:
+            raise OLMoConfigurationError(
+                f"Invalid SAM normalization '{self.normalization}'. Expected one of: 'none', 'global', 'layer'"
+            )

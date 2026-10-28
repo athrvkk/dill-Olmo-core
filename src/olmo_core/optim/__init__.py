@@ -1,5 +1,6 @@
 from .adam import AdamConfig
 from .adamw import AdamWConfig, SkipStepAdamW, SkipStepAdamWConfig
+from .cautious import CautiousAdamW, CautiousAdamWConfig
 from .config import (
     INITIAL_LR_FIELD,
     LR_FIELD,
@@ -8,9 +9,12 @@ from .config import (
     OptimGroupOverride,
 )
 from .dion import DionConfig
+from .kron import Kron, KronConfig
 from .lion import Lion, LionConfig, SkipStepLion, SkipStepLionConfig
+from .mars import Mars, MarsConfig
 from .moe_optimizer import OLMoDDPOptimizer, OLMoDDPOptimizerConfig
 from .muon import MuonConfig, NorMuonConfig
+from .nadamw import NAdamW, NAdamWConfig
 from .noop import NoOpConfig, NoOpOptimizer
 from .scheduler import (
     WSD,
@@ -29,7 +33,10 @@ from .scheduler import (
     SchedulerUnits,
     SequentialScheduler,
 )
+from .scion import Scion, ScionConfig
 from .skip_step_optimizer import SkipStepOptimizer
+from .soap import Soap, SoapConfig
+from .sophia import Sophia, SophiaConfig
 
 __all__ = [
     "OptimConfig",
@@ -51,6 +58,20 @@ __all__ = [
     "SkipStepLion",
     "NoOpConfig",
     "NoOpOptimizer",
+    "CautiousAdamWConfig",
+    "CautiousAdamW",
+    "KronConfig",
+    "Kron",
+    "MarsConfig",
+    "Mars",
+    "NAdamWConfig",
+    "NAdamW",
+    "ScionConfig",
+    "Scion",
+    "SoapConfig",
+    "Soap",
+    "SophiaConfig",
+    "Sophia",
     "Scheduler",
     "SchedulerUnits",
     "ConstantScheduler",

@@ -8,6 +8,7 @@ from .config import (
     TransformerExpertParallelConfig,
     TransformerPipelineParallelConfig,
     TransformerPipelineTrainModuleConfig,
+    TransformerSAMConfig,
     TransformerTensorParallelConfig,
     TransformerTrainModuleConfig,
 )
@@ -22,11 +23,22 @@ from .pipeline.pipeline_schedule import (
     CustomScheduleInterleaved1F1B,
 )
 from .pipeline_train_module import TransformerPipelineTrainModule
+from .sam_train_module import (
+    SAMConstantScheduler,
+    SAMCosineScheduler,
+    SAMScheduler,
+    TransformerSAMTrainModule,
+)
 from .train_module import TransformerTrainModule
 
 __all__ = [
     "TransformerTrainModule",
     "TransformerTrainModuleConfig",
+    "TransformerSAMTrainModule",
+    "TransformerSAMConfig",
+    "SAMScheduler",
+    "SAMConstantScheduler",
+    "SAMCosineScheduler",
     "MultimodalTransformerTrainModule",
     "MultimodalTransformerTrainModuleConfig",
     "TransformerPipelineTrainModule",

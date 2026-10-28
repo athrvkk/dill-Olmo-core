@@ -22,6 +22,7 @@ __all__ = [
     "FeedForwardType",
     "FeedForwardConfig",
     "FeedForward",
+    "MLPFeedForward",
     "NormalizedFeedForward",
 ]
 
@@ -65,6 +66,11 @@ class FeedForwardType(StrEnum):
     ➡️ :class:`NormalizedFeedForward`
     """
 
+    mlp = "mlp"
+    """
+    ➡️ :class:`MLPFeedForward` (non-gated)
+    """
+
 
 @dataclass
 class FeedForwardConfig(ModuleConfig):
@@ -93,6 +99,12 @@ class FeedForwardConfig(ModuleConfig):
         bias = self.bias if self.bias is not None else self.name != FeedForwardType.normalized
 
         params = 0
+
+        if self.name == FeedForwardType.mlp:
+            params += 2 * d_model * self.hidden_size
+            if bias:
+                params += self.hidden_size + d_model
+            return params
 
         params += 3 * d_model * self.hidden_size
         if bias:
@@ -131,6 +143,8 @@ class FeedForwardConfig(ModuleConfig):
                         f"NormalizedFeedForward only supports 'silu' activation, got '{activation}'"
                     )
                 return NormalizedFeedForward(**kwargs)
+            elif self.name == FeedForwardType.mlp:
+                return MLPFeedForward(**kwargs)
             else:
                 raise NotImplementedError(self.name)
         except TypeError as e:
@@ -207,6 +221,73 @@ class FeedForward(nn.Module):
         del seq_len
         # 6 FLOPs per parameter (2 ops * 3 for forward+backward)
         return 6 * sum(p.numel() for p in self.parameters())
+
+
+class MLPFeedForward(FeedForward):
+    """
+    Non-gated feed-forward module, ``w2(act(w1(x)))``, e.g. the GELU MLP of GPT-2.
+    It has no ``w3`` (``self.w3`` is ``None``).
+    """
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        hidden_size: int,
+        bias: bool = True,
+        dtype: torch.dtype = torch.float32,
+        init_device: str = "cpu",
+        activation: ActivationFunction = ActivationFunction.gelu_tanh,
+    ):
+        super().__init__(
+            d_model=d_model,
+            hidden_size=hidden_size,
+            bias=bias,
+            dtype=dtype,
+            init_device=init_device,
+            activation=activation,
+        )
+        self.w3 = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Run the feed-forward on the input ``x``.
+
+        :param x: The input of shape ``(*, d_model)``.
+        """
+        return self.w2(self.activation_fn(self.w1(x)))
+
+    def apply_tp(
+        self,
+        tp_mesh: DeviceMesh,
+        input_layout: Optional[Placement] = None,
+        output_layout: Optional[Placement] = None,
+        use_local_output: bool = True,
+        float8_enabled: bool = False,
+    ):
+        rowwise_parallel, colwise_parallel, prepare_module_input = get_tp_wrappers(
+            float8_enabled=float8_enabled
+        )
+
+        parallelize_module(
+            module=self,
+            device_mesh=tp_mesh,
+            parallelize_plan=prepare_module_input(
+                input_layouts=None if input_layout is None else (input_layout,),
+                desired_input_layouts=(Replicate(),),
+            ),
+        )
+
+        parallelize_module(
+            module=self,
+            device_mesh=tp_mesh,
+            parallelize_plan={
+                "w1": colwise_parallel(),
+                "w2": rowwise_parallel(
+                    output_layouts=output_layout, use_local_output=use_local_output
+                ),
+            },
+        )
 
 
 @beta_feature

@@ -9,7 +9,13 @@ from olmo_core.distributed.checkpoint import (
     save_model_and_optim_state,
 )
 from olmo_core.distributed.utils import get_rank, get_world_size
-from olmo_core.nn.feed_forward import ActivationFunction, FeedForward
+from olmo_core.nn.feed_forward import (
+    ActivationFunction,
+    FeedForward,
+    FeedForwardConfig,
+    FeedForwardType,
+    MLPFeedForward,
+)
 from olmo_core.testing import BACKENDS, run_distributed_test
 from olmo_core.utils import get_default_device, record_flops, seed_all
 
@@ -117,3 +123,37 @@ def test_feed_forward_activations(activation: ActivationFunction):
 
     y.sum().backward()
     assert ff.w1.weight.grad is not None
+
+
+@pytest.mark.parametrize("bias", [True, False])
+def test_mlp_feed_forward(bias: bool):
+    seed_all(0)
+    d_model = 64
+    config = FeedForwardConfig(
+        hidden_size=4 * d_model,
+        name=FeedForwardType.mlp,
+        activation=ActivationFunction.gelu_tanh,
+        bias=bias,
+    )
+    ff = config.build(d_model)
+    assert isinstance(ff, MLPFeedForward)
+    assert ff.w3 is None
+    assert config.num_params(d_model) == sum(p.numel() for p in ff.parameters())
+
+    x = torch.randn(2, 8, d_model)
+    expected = ff.w2(torch.nn.functional.gelu(ff.w1(x), approximate="tanh"))
+    torch.testing.assert_close(ff(x), expected)
+
+
+def test_mlp_feed_forward_fan_in_init():
+    from olmo_core.nn.transformer.init import InitMethod
+
+    d_model, hidden_size = 64, 256
+    ff = MLPFeedForward(d_model=d_model, hidden_size=hidden_size, bias=False)
+    InitMethod.fan_in.init_feed_forward(ff, d_model=d_model, block_idx=0, num_blocks=2)
+
+    # Trunc-normal at 3 std shrinks the std by ~0.986.
+    torch.testing.assert_close(ff.w1.weight.std().item(), 0.986 * d_model**-0.5, rtol=0.05, atol=0)
+    torch.testing.assert_close(
+        ff.w2.weight.std().item(), 0.986 * hidden_size**-0.5, rtol=0.05, atol=0
+    )

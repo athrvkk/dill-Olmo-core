@@ -161,14 +161,15 @@ class InitMethod(StrEnum):
 
         # Compute std for w3 initialization
         if self == InitMethod.fan_in:
-            # For fan_in, w3 uses 1/√d_in where d_in = d_model
-            std = m.w3.in_features**-0.5
+            # For fan_in, w3 uses 1/√d_in where d_in = d_model (ignored by non-gated MLPs)
+            std = m.w1.in_features**-0.5
         elif self == InitMethod.llama:
             std = std / (2 * num_blocks) ** 0.5
         elif self == InitMethod.llama_depth:
             std = std / (2 * (block_idx + 1)) ** 0.5
 
-        init_linear(m.w3, std=std, generator=generator)
+        if m.w3 is not None:  # None for non-gated MLPFeedForward
+            init_linear(m.w3, std=std, generator=generator)
 
         # Compute std for w2 initialization
         if self == InitMethod.fan_in:

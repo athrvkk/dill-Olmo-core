@@ -8,6 +8,11 @@ Usage::
 
     torchrun --nproc-per-node=1 src/scripts/launch_from_yaml.py CONFIG.yaml [dot.notation=overrides ...]
     python src/scripts/launch_from_yaml.py CONFIG.yaml --dry-run
+
+Batch sizes can be given in sequences instead of tokens with the top-level fields
+``global_batch_size_seqs`` and ``rank_microbatch_size_seqs``; they are multiplied by
+``dataset.sequence_length`` to set ``data_loader.global_batch_size`` and
+``train_module.rank_microbatch_size``.
 """
 
 import argparse
@@ -16,7 +21,10 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, cast
 
-from olmo_core.config import Config
+import yaml
+from cached_path import cached_path
+
+from olmo_core.config import Config, _clean_opts, _set_nested
 from olmo_core.data import (
     NumpyDataLoaderConfig,
     NumpyDatasetConfig,
@@ -235,9 +243,47 @@ def _parse_args() -> Tuple[argparse.Namespace, List[str]]:
     return _parser().parse_known_args()
 
 
+# Top-level field in sequences -> (section, field in tokens) it sets.
+_BATCH_SIZE_SEQS_FIELDS = {
+    "global_batch_size_seqs": ("data_loader", "global_batch_size"),
+    "rank_microbatch_size_seqs": ("train_module", "rank_microbatch_size"),
+}
+
+
+def _resolve_batch_sizes_in_seqs(data: Dict[str, Any]) -> None:
+    """
+    Replace the ``*_seqs`` batch size fields in the raw config with their token equivalents.
+    """
+    for seqs_key, (section, field) in _BATCH_SIZE_SEQS_FIELDS.items():
+        num_seqs = data.pop(seqs_key, None)
+        if num_seqs is None:
+            continue
+        seq_len = (data.get("dataset") or {}).get("sequence_length")
+        if seq_len is None:
+            raise ValueError(f"'{seqs_key}' requires 'dataset.sequence_length' to be set")
+        target = data.setdefault(section, {})
+        if target.get(field) is not None:
+            raise ValueError(
+                f"Set either '{seqs_key}' or '{section}.{field}', not both "
+                f"(got {num_seqs} sequences and {target[field]} tokens)"
+            )
+        target[field] = int(num_seqs) * int(seq_len)
+        log.info(f"{section}.{field} = {num_seqs} sequences x {seq_len} = {target[field]} tokens")
+
+
+def _load_config(path: str, overrides: List[str]) -> YamlExperimentConfig:
+    with cached_path(path).open() as f:
+        data = yaml.safe_load(f)
+    # Apply CLI overrides to the raw YAML first so they can also set the ``*_seqs`` fields.
+    for key, value in _clean_opts(overrides):
+        _set_nested(data, key, value)
+    _resolve_batch_sizes_in_seqs(data)
+    return YamlExperimentConfig.from_dict(data)
+
+
 def main():
     opts, overrides = _parse_args()
-    cfg = YamlExperimentConfig.from_file(opts.config, overrides=overrides)
+    cfg = _load_config(opts.config, overrides)
 
     missing = [
         name

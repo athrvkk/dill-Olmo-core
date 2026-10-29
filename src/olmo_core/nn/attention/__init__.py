@@ -415,6 +415,12 @@ class AttentionConfig(SequenceMixerConfig["SequenceMixer"]):
         transposes Q/K/V (a view -> still packed) but for GQA (``n_kv_heads < n_heads``) it also
         repeats K/V into fresh storage before SDPA, so only Q is packed for GQA on that backend.
     """
+    track_max_logit: bool = False
+    """
+    Track the max pre-softmax attention logit ``<q, k> * scale`` over causal positions during
+    training (as in Wortsman et al. 2024, Fig. G.1). Logged as ``block NN/max attention logit``.
+    Only supported by ``default`` attention.
+    """
 
     def num_params(self, d_model: int) -> int:
         """
@@ -581,7 +587,7 @@ class AttentionConfig(SequenceMixerConfig["SequenceMixer"]):
             )
 
         if self.name != AttentionType.default:
-            for key in ("scalable_softmax", "qk_norm_per_head_gains"):
+            for key in ("scalable_softmax", "qk_norm_per_head_gains", "track_max_logit"):
                 if kwargs.pop(key, False):
                     raise OLMoConfigurationError(
                         f"'{key}' is not supported with {self.name} attention"
@@ -655,6 +661,8 @@ class Attention(SequenceMixer):
         Context parallelism, KV caching, and sliding window attention are unsupported.
     :param dtype: The default data type to use for parameters.
     :param init_device: The device to initialize weights on.
+    :param track_max_logit: Track the max pre-softmax attention logit during training.
+        See :meth:`compute_max_logit()`.
     """
 
     def __init__(
@@ -683,9 +691,12 @@ class Attention(SequenceMixer):
         mxfp8_save_qkv_for_backward: bool = False,
         scalable_softmax: bool = False,
         qk_norm_per_head_gains: bool = False,
+        track_max_logit: bool = False,
     ):
         super().__init__()
 
+        self.track_max_logit = track_max_logit
+        self._max_logit: Optional[torch.Tensor] = None
         self.use_recompute_qkv_prep = use_recompute_qkv_prep
         self.mxfp8_save_qkv_for_backward = mxfp8_save_qkv_for_backward
         self._mxfp8_saved_qkv_for_backward_last_pack_count = 0
@@ -1100,6 +1111,9 @@ class Attention(SequenceMixer):
                 position_ids=position_ids,
             )
 
+        if self.track_max_logit and self.training and self.kv_cache_manager is None:
+            self._update_max_logit(q, k)
+
         # Optionally save Q/K/V for backward as MXFP8 to reduce the saved-activation footprint.
         self._mxfp8_saved_qkv_for_backward_last_pack_count = 0
         qkv_save_counter = [0]
@@ -1157,6 +1171,48 @@ class Attention(SequenceMixer):
 
         # shape: (batch_size, seq_len, d_model)
         return self.w_out(att)
+
+    @torch.compiler.disable
+    @torch.no_grad()
+    def _update_max_logit(self, q: torch.Tensor, k: torch.Tensor):
+        """
+        Update the running max of the pre-softmax attention logits over causal positions.
+        Intra-document masks are ignored, so with document masking this is an upper bound.
+
+        :param q: Queries of shape ``(batch_size, seq_len, n_heads, head_dim)``.
+        :param k: Keys of shape ``(batch_size, seq_len, n_kv_heads, head_dim)``.
+        """
+        scale = self.backend.scale if self.backend.scale is not None else self.head_dim**-0.5
+        if self.n_kv_heads != self.n_heads:
+            k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=2)
+        B, T, H, _ = q.shape
+        causal = torch.ones(T, T, dtype=torch.bool, device=q.device).tril()
+        # Chunk over the batch so the fp32 logits stay under ~512MB.
+        chunk = max(1, (1 << 27) // (H * T * T))
+        max_logit = q.new_full((), float("-inf"), dtype=torch.float32)
+        for i in range(0, B, chunk):
+            # shape: (chunk, n_heads, seq_len, seq_len)
+            logits = torch.einsum(
+                "bqhd,bkhd->bhqk", q[i : i + chunk].float(), k[i : i + chunk].float()
+            )
+            logits.masked_fill_(~causal, float("-inf"))
+            max_logit = torch.maximum(max_logit, logits.amax() * scale)
+        self._max_logit = (
+            max_logit if self._max_logit is None else torch.maximum(self._max_logit, max_logit)
+        )
+
+    def compute_max_logit(self, reset: bool = True) -> Optional[torch.Tensor]:
+        """
+        Get the max pre-softmax attention logit seen since the last reset.
+
+        :param reset: Reset the tracked value afterwards.
+
+        :returns: A scalar tensor, or ``None`` if nothing has been tracked.
+        """
+        max_logit = self._max_logit
+        if reset:
+            self._max_logit = None
+        return max_logit
 
     def apply_tp(
         self,

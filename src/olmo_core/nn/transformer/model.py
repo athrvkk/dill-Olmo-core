@@ -211,11 +211,29 @@ class Transformer(nn.Module):
     def compute_auxiliary_metrics(
         self, reset: bool = True
     ) -> Dict[str, Tuple[torch.Tensor, Optional["ReduceType"]]]:
-        del reset
-        return {}
+        from olmo_core.train.common import ReduceType
+
+        out: Dict[str, Tuple[torch.Tensor, Optional["ReduceType"]]] = {}
+        for block_idx, block in self.blocks.items():
+            attention = getattr(block, "attention", None)
+            # NOTE: FusedAttentionV2 skips Attention.__init__, so the attribute may be missing.
+            if not isinstance(attention, Attention) or not getattr(
+                attention, "track_max_logit", False
+            ):
+                continue
+            max_logit = attention.compute_max_logit(reset=reset)
+            if max_logit is not None:
+                out[f"block {int(block_idx):02d}/max attention logit"] = (
+                    max_logit,
+                    ReduceType.max,
+                )
+        return out
 
     def reset_auxiliary_metrics(self):
-        pass
+        for block in self.blocks.values():
+            attention = getattr(block, "attention", None)
+            if isinstance(attention, Attention) and getattr(attention, "track_max_logit", False):
+                attention.compute_max_logit(reset=True)
 
     @property
     def pp_enabled(self) -> bool:

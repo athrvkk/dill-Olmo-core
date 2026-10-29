@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from olmo_core.nn.functional import cross_entropy_loss, weighted_cross_entropy_loss
-from olmo_core.testing import DEVICES
+from olmo_core.testing import DEVICES, requires_gpu
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -79,3 +79,32 @@ def test_weighted_cross_entropy_loss_ignores_zero_weight_tokens(device):
     torch.testing.assert_close(ce_loss, ce_pad)
     assert z_loss is not None and z_pad is not None
     torch.testing.assert_close(z_loss, z_pad)
+
+
+@requires_gpu
+@pytest.mark.parametrize("compute_z_loss", [False, True])
+def test_fused_linear_cross_entropy_loss_matches_default(compute_z_loss: bool):
+    pytest.importorskip("liger_kernel")
+    from olmo_core.nn.functional import fused_linear_cross_entropy_loss
+
+    torch.manual_seed(0)
+    N, d_model, vocab_size = 64, 32, 1000
+    h = torch.randn(N, d_model, device="cuda")
+    weight = torch.randn(vocab_size, d_model, device="cuda")
+    labels = torch.randint(0, vocab_size, (N,), device="cuda")
+
+    ce_ref, z_ref = cross_entropy_loss(
+        h @ weight.T, labels, compute_z_loss=compute_z_loss, z_loss_multiplier=1e-4
+    )
+    ce_fused, z_fused = fused_linear_cross_entropy_loss(
+        h, weight, labels, compute_z_loss=compute_z_loss, z_loss_multiplier=1e-4
+    )
+    if compute_z_loss:
+        # The fused loss includes z-loss; the default returns it separately.
+        assert z_ref is not None and z_fused is not None
+        torch.testing.assert_close(z_fused, z_ref, rtol=1e-3, atol=1e-5)
+        torch.testing.assert_close(ce_fused, ce_ref + z_ref, rtol=1e-3, atol=1e-4)
+    else:
+        # With z-loss off, no z-loss term may be added to the fused loss.
+        assert z_fused is None
+        torch.testing.assert_close(ce_fused, ce_ref, rtol=1e-3, atol=1e-4)

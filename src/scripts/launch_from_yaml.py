@@ -20,6 +20,16 @@ and simple arithmetic left after substitution is evaluated, e.g.::
     hidden_size: ${model.d_model}*4
     weight_decay: 1e-4/${train_module.optim.lr}
     save_folder: checkpoints/${wandb.group}/${wandb.name}
+
+A reference can carry a Python format spec, ``${path:spec}`` (plus ``.Nsci`` for compact scientific
+notation with up to N significant figures, e.g. ``${train_module.optim.lr:.3sci}`` -> ``3e-1``), and
+a top-level ``vars:`` section
+holds helper values that are only used by references (it is removed before the config is built)::
+
+    vars:
+      n_tokens_b: ${n_tokens}/1e9
+    wandb:
+      name: run-tokens-${vars.n_tokens_b:.3g}B     # -> run-tokens-13.1B
 """
 
 import argparse
@@ -315,8 +325,28 @@ def _eval_arithmetic(expr: str) -> Any:
         return expr
 
 
-def _format_value(value: Any) -> str:
+def _format_sci(value: float, digits: int) -> str:
+    """Compact scientific notation with up to ``digits`` significant figures: 0.3 -> "3e-1"."""
+    if value == 0:
+        return "0"
+    mantissa, exponent = format(value, f".{max(digits - 1, 0)}e").split("e")
+    if "." in mantissa:
+        mantissa = mantissa.rstrip("0").rstrip(".")
+    return f"{mantissa}e{int(exponent)}"
+
+
+def _format_value(value: Any, spec: str = "") -> str:
     """How a referenced value is written when substituted into a longer string."""
+    if spec:
+        if isinstance(value, str):
+            # e.g. a CLI override "3e-3", which YAML 1.1 reads as a string
+            try:
+                value = float(value)
+            except ValueError:
+                pass
+        if (m := re.fullmatch(r"\.?(\d*)sci", spec)) is not None:
+            return _format_sci(value, int(m.group(1) or 3))
+        return format(value, spec)
     if isinstance(value, float):
         return format(value, "g")  # 0.01 -> "0.01", 1e-05 -> "1e-05"
     return str(value)
@@ -324,9 +354,10 @@ def _format_value(value: Any) -> str:
 
 def _resolve_interpolations(data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Resolve ``${path.to.field}`` references anywhere in the raw config. A value that is a single
-    reference keeps the referenced value's type; references inside a longer string are substituted
-    as text, and the result is evaluated if it is a plain arithmetic expression.
+    Resolve ``${path.to.field}`` / ``${path.to.field:format_spec}`` references anywhere in the raw
+    config. A value that is a single reference without a format spec keeps the referenced value's
+    type; otherwise references are substituted as text, and the result is evaluated if it is a
+    plain arithmetic expression.
     """
     in_progress: set = set()
 
@@ -352,14 +383,21 @@ def _resolve_interpolations(data: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"Circular reference involving '{where}'")
         in_progress.add(where)
         try:
-            if (m := _INTERPOLATION.fullmatch(value.strip())) is not None:
+            m = _INTERPOLATION.fullmatch(value.strip())
+            if m is not None and ":" not in m.group(1):
                 return lookup(m.group(1).strip())
-            text = _INTERPOLATION.sub(lambda m: _format_value(lookup(m.group(1).strip())), value)
+            text = _INTERPOLATION.sub(lambda m: substitute(m.group(1)), value)
             return _eval_arithmetic(text)
         finally:
             in_progress.discard(where)
 
-    return resolve(data, "")
+    def substitute(ref: str) -> str:
+        path, _, spec = ref.partition(":")
+        return _format_value(lookup(path.strip()), spec.strip())
+
+    resolved = resolve(data, "")
+    resolved.pop("vars", None)  # helper values only used by references
+    return resolved
 
 
 def _load_config(path: str, overrides: List[str]) -> YamlExperimentConfig:

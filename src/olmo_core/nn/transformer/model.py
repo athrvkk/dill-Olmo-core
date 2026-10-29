@@ -216,24 +216,40 @@ class Transformer(nn.Module):
         out: Dict[str, Tuple[torch.Tensor, Optional["ReduceType"]]] = {}
         for block_idx, block in self.blocks.items():
             attention = getattr(block, "attention", None)
-            # NOTE: FusedAttentionV2 skips Attention.__init__, so the attribute may be missing.
-            if not isinstance(attention, Attention) or not getattr(
-                attention, "track_max_logit", False
-            ):
+            if not isinstance(attention, Attention):
                 continue
-            max_logit = attention.compute_max_logit(reset=reset)
-            if max_logit is not None:
-                out[f"block {int(block_idx):02d}/max attention logit"] = (
-                    max_logit,
-                    ReduceType.max,
-                )
+            # NOTE: FusedAttentionV2 skips Attention.__init__, so the attributes may be missing.
+            if getattr(attention, "track_max_logit", False):
+                max_logit = attention.compute_max_logit(reset=reset)
+                if max_logit is not None:
+                    out[f"block {int(block_idx):02d}/max attention logit"] = (
+                        max_logit,
+                        ReduceType.max,
+                    )
+            if getattr(attention, "track_attention_entropy", False):
+                entropy = attention.compute_attention_entropy(reset=reset)
+                if entropy is not None:
+                    out[f"block {int(block_idx):02d}/attention entropy"] = (
+                        entropy,
+                        ReduceType.mean,
+                    )
+        if self.lm_head is not None and self.lm_head.track_logit_mean:
+            logit_mean = self.lm_head.compute_logit_mean(reset=reset)
+            if logit_mean is not None:
+                out["output logit mean"] = (logit_mean, ReduceType.mean)
         return out
 
     def reset_auxiliary_metrics(self):
         for block in self.blocks.values():
             attention = getattr(block, "attention", None)
-            if isinstance(attention, Attention) and getattr(attention, "track_max_logit", False):
+            if not isinstance(attention, Attention):
+                continue
+            if getattr(attention, "track_max_logit", False):
                 attention.compute_max_logit(reset=True)
+            if getattr(attention, "track_attention_entropy", False):
+                attention.compute_attention_entropy(reset=True)
+        if self.lm_head is not None and self.lm_head.track_logit_mean:
+            self.lm_head.compute_logit_mean(reset=True)
 
     @property
     def pp_enabled(self) -> bool:

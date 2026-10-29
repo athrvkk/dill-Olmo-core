@@ -135,6 +135,11 @@ class LMHeadConfig(ModuleConfig):
     default loss only; tensor parallelism is not supported. See
     :class:`~olmo_core.nn.fp32_linear.FP32OutputLinear` for backward semantics.
     """
+    track_logit_mean: bool = False
+    """
+    Track the mean output logit (over tokens and vocab) during training, as in Wortsman et al.
+    2024, Fig. G.2. Logged as ``output logit mean``. Default head only.
+    """
 
     def num_params(self, d_model: int, vocab_size: int) -> int:
         """
@@ -167,8 +172,11 @@ class LMHeadConfig(ModuleConfig):
         kwargs.pop("name")
         if self.fp32_output and self.name != LMHeadType.default:
             raise OLMoConfigurationError("fp32_output requires the default LM head")
+        if self.track_logit_mean and self.name != LMHeadType.default:
+            raise OLMoConfigurationError("track_logit_mean requires the default LM head")
         if self.name != LMHeadType.default:
             kwargs.pop("fp32_output")
+            kwargs.pop("track_logit_mean")
         kwargs.update(
             d_model=d_model,
             vocab_size=vocab_size,
@@ -216,11 +224,15 @@ class LMHead(nn.Module):
         init_device: str = "cpu",
         loss_implementation: LMLossImplementation = LMLossImplementation.default,
         fp32_output: bool = False,
+        track_logit_mean: bool = False,
     ):
         super().__init__()
         if fp32_output and loss_implementation != LMLossImplementation.default:
             raise OLMoConfigurationError("fp32_output requires the default LM loss implementation")
         self.fp32_output = fp32_output
+        self.track_logit_mean = track_logit_mean
+        self._logit_sum: Optional[torch.Tensor] = None
+        self._logit_count = 0
         self.norm = (
             None if layer_norm is None else layer_norm.build(d_model, init_device=init_device)
         )
@@ -307,6 +319,9 @@ class LMHead(nn.Module):
                 raise RuntimeError("'return_logits=False' is only valid when 'labels' is provided")
             return self.w_out(h)
 
+        if self.track_logit_mean and self.training:
+            self._update_logit_mean(h)
+
         logits: Optional[torch.Tensor]
         loss: torch.Tensor
         ce_loss: torch.Tensor
@@ -377,6 +392,41 @@ class LMHead(nn.Module):
                 reduce_across_tp_group=False,
             ),
         )
+
+    @torch.compiler.disable
+    @torch.no_grad()
+    def _update_logit_mean(self, h: torch.Tensor):
+        """
+        Accumulate the mean output logit without materializing the logits, using
+        ``mean_v(h @ W.T + b) = h @ mean_v(W) + mean_v(b)``.
+
+        :param h: The (normed) hidden states fed to :data:`w_out`, of shape ``(..., d_model)``.
+        """
+        # Autocast would otherwise run the matmul in bf16 despite the fp32 inputs.
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            h = get_local_tensor(h).reshape(-1, self.d_model).float()
+            w_mean = get_local_tensor(self.w_out.weight).float().mean(dim=0)
+            logit_sum = (h @ w_mean).sum()
+            if self.w_out.bias is not None:
+                logit_sum = (
+                    logit_sum + get_local_tensor(self.w_out.bias).float().mean() * h.shape[0]
+                )
+        self._logit_sum = logit_sum if self._logit_sum is None else self._logit_sum + logit_sum
+        self._logit_count += h.shape[0]
+
+    def compute_logit_mean(self, reset: bool = True) -> Optional[torch.Tensor]:
+        """
+        Get the mean output logit over all tokens seen since the last reset.
+
+        :param reset: Reset the tracked value afterwards.
+
+        :returns: A scalar tensor, or ``None`` if nothing has been tracked.
+        """
+        logit_mean = None if self._logit_sum is None else self._logit_sum / self._logit_count
+        if reset:
+            self._logit_sum = None
+            self._logit_count = 0
+        return logit_mean
 
     def _finalize_loss(
         self,

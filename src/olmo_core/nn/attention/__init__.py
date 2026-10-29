@@ -421,6 +421,12 @@ class AttentionConfig(SequenceMixerConfig["SequenceMixer"]):
     training (as in Wortsman et al. 2024, Fig. G.1). Logged as ``block NN/max attention logit``.
     Only supported by ``default`` attention.
     """
+    track_attention_entropy: bool = False
+    """
+    Track the attention entropy ``-sum_j A_ij log A_ij`` averaged over examples, heads, and query
+    positions during training (as in Zhai et al. 2023, Sec. 3.1). Logged as
+    ``block NN/attention entropy``. Only supported by ``default`` attention.
+    """
 
     def num_params(self, d_model: int) -> int:
         """
@@ -587,7 +593,12 @@ class AttentionConfig(SequenceMixerConfig["SequenceMixer"]):
             )
 
         if self.name != AttentionType.default:
-            for key in ("scalable_softmax", "qk_norm_per_head_gains", "track_max_logit"):
+            for key in (
+                "scalable_softmax",
+                "qk_norm_per_head_gains",
+                "track_max_logit",
+                "track_attention_entropy",
+            ):
                 if kwargs.pop(key, False):
                     raise OLMoConfigurationError(
                         f"'{key}' is not supported with {self.name} attention"
@@ -663,6 +674,8 @@ class Attention(SequenceMixer):
     :param init_device: The device to initialize weights on.
     :param track_max_logit: Track the max pre-softmax attention logit during training.
         See :meth:`compute_max_logit()`.
+    :param track_attention_entropy: Track the mean attention entropy during training.
+        See :meth:`compute_attention_entropy()`.
     """
 
     def __init__(
@@ -692,11 +705,15 @@ class Attention(SequenceMixer):
         scalable_softmax: bool = False,
         qk_norm_per_head_gains: bool = False,
         track_max_logit: bool = False,
+        track_attention_entropy: bool = False,
     ):
         super().__init__()
 
         self.track_max_logit = track_max_logit
         self._max_logit: Optional[torch.Tensor] = None
+        self.track_attention_entropy = track_attention_entropy
+        self._entropy_sum: Optional[torch.Tensor] = None
+        self._entropy_count = 0
         self.use_recompute_qkv_prep = use_recompute_qkv_prep
         self.mxfp8_save_qkv_for_backward = mxfp8_save_qkv_for_backward
         self._mxfp8_saved_qkv_for_backward_last_pack_count = 0
@@ -1111,8 +1128,12 @@ class Attention(SequenceMixer):
                 position_ids=position_ids,
             )
 
-        if self.track_max_logit and self.training and self.kv_cache_manager is None:
-            self._update_max_logit(q, k)
+        if (
+            (self.track_max_logit or self.track_attention_entropy)
+            and self.training
+            and self.kv_cache_manager is None
+        ):
+            self._update_attention_stats(q, k)
 
         # Optionally save Q/K/V for backward as MXFP8 to reduce the saved-activation footprint.
         self._mxfp8_saved_qkv_for_backward_last_pack_count = 0
@@ -1174,10 +1195,12 @@ class Attention(SequenceMixer):
 
     @torch.compiler.disable
     @torch.no_grad()
-    def _update_max_logit(self, q: torch.Tensor, k: torch.Tensor):
+    def _update_attention_stats(self, q: torch.Tensor, k: torch.Tensor):
         """
-        Update the running max of the pre-softmax attention logits over causal positions.
-        Intra-document masks are ignored, so with document masking this is an upper bound.
+        Recompute the scaled pre-softmax attention logits ``<q, k> * scale`` over causal positions
+        in fp32 and update the running max logit and/or the running attention-entropy sum.
+        Intra-document masks are ignored, so with document masking the max is an upper bound and
+        the entropy includes cross-document keys.
 
         :param q: Queries of shape ``(batch_size, seq_len, n_heads, head_dim)``.
         :param k: Keys of shape ``(batch_size, seq_len, n_kv_heads, head_dim)``.
@@ -1187,19 +1210,48 @@ class Attention(SequenceMixer):
             k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=2)
         B, T, H, _ = q.shape
         causal = torch.ones(T, T, dtype=torch.bool, device=q.device).tril()
-        # Chunk over the batch so the fp32 logits stay under ~512MB.
+        # Chunk over the batch so each fp32 (chunk, H, T, T) tensor stays under ~512MB.
         chunk = max(1, (1 << 27) // (H * T * T))
         max_logit = q.new_full((), float("-inf"), dtype=torch.float32)
-        for i in range(0, B, chunk):
-            # shape: (chunk, n_heads, seq_len, seq_len)
-            logits = torch.einsum(
-                "bqhd,bkhd->bhqk", q[i : i + chunk].float(), k[i : i + chunk].float()
+        entropy_sum = q.new_zeros((), dtype=torch.float32)
+        # Autocast would otherwise run the einsum in bf16 despite the fp32 inputs.
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            for i in range(0, B, chunk):
+                # shape: (chunk, n_heads, seq_len, seq_len)
+                logits = torch.einsum(
+                    "bqhd,bkhd->bhqk", q[i : i + chunk].float(), k[i : i + chunk].float()
+                )
+                logits.mul_(scale).masked_fill_(~causal, float("-inf"))
+                if self.track_max_logit:
+                    max_logit = torch.maximum(max_logit, logits.amax())
+                if self.track_attention_entropy:
+                    # entr(p) = -p * log(p), with entr(0) = 0 for the masked positions.
+                    entropy_sum += torch.special.entr(logits.softmax(dim=-1)).sum()
+        if self.track_max_logit:
+            self._max_logit = (
+                max_logit if self._max_logit is None else torch.maximum(self._max_logit, max_logit)
             )
-            logits.masked_fill_(~causal, float("-inf"))
-            max_logit = torch.maximum(max_logit, logits.amax() * scale)
-        self._max_logit = (
-            max_logit if self._max_logit is None else torch.maximum(self._max_logit, max_logit)
-        )
+        if self.track_attention_entropy:
+            self._entropy_sum = (
+                entropy_sum if self._entropy_sum is None else self._entropy_sum + entropy_sum
+            )
+            # One entropy value per (example, head, query position).
+            self._entropy_count += B * H * T
+
+    def compute_attention_entropy(self, reset: bool = True) -> Optional[torch.Tensor]:
+        """
+        Get the mean attention entropy (in nats) since the last reset, averaged over examples,
+        heads, and query positions, as in Zhai et al. 2023.
+
+        :param reset: Reset the tracked value afterwards.
+
+        :returns: A scalar tensor, or ``None`` if nothing has been tracked.
+        """
+        entropy = None if self._entropy_sum is None else self._entropy_sum / self._entropy_count
+        if reset:
+            self._entropy_sum = None
+            self._entropy_count = 0
+        return entropy
 
     def compute_max_logit(self, reset: bool = True) -> Optional[torch.Tensor]:
         """
